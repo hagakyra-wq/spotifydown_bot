@@ -20,7 +20,27 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
+# ==========================================
+# ОБМАНКА ДЛЯ RENDER (WEB-ЗАГЛУШКА)
+# ==========================================
+async def handle_ping(request):
+    return web.Response(text="Bot is alive!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render автоматически передает порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Веб-заглушка для Render запущен на порту {port}")
 # ==========================================
 # ИНИЦИАЛИЗАЦИЯ И КОНФИГУРАЦИЯ
 # ==========================================
