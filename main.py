@@ -140,7 +140,7 @@ async def restore_db_from_telegram():
         return
 
     logger.info("База данных не найдена. Попытка восстановления из ЛС Админа...")
-    init_db()  д
+    init_db() 
     
     try:
         # Получаем обновления через getUpdates или скачиваем из истории чата с админом, 
