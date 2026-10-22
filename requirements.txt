@@ -1,0 +1,4 @@
+aiogram>=3.3.0
+spotipy>=2.23.0
+apscheduler>=3.10.4
+python-dotenv>=1.0.1

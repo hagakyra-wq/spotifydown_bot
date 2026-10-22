@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+bot.db
+bot.db-shm
+bot.db-wal
+__pycache__/
+*.py[cod]
+temp_music/
+.venv/
+venv/
