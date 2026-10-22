@@ -9,11 +9,11 @@ from datetime import datetime, timedelta, time
 import zoneinfo
 
 from dotenv import load_dotenv
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
 import yt_dlp
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, TDRC, TRCK, TPE2, APIC
 from openai import AsyncOpenAI
+import httpx
+from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
@@ -22,25 +22,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiohttp import web
 
-# ==========================================
-# ОБМАНКА ДЛЯ RENDER (WEB-ЗАГЛУШКА)
-# ==========================================
-async def handle_ping(request):
-    return web.Response(text="Bot is alive!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    # Render автоматически передает порт через переменную окружения PORT
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Веб-заглушка для Render запущен на порту {port}")
 # ==========================================
 # ИНИЦИАЛИЗАЦИЯ И КОНФИГУРАЦИЯ
 # ==========================================
@@ -55,8 +36,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
-SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
@@ -68,17 +47,31 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
 
-sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
-    client_id=SPOTIPY_CLIENT_ID,
-    client_secret=SPOTIPY_CLIENT_SECRET
-))
-
 groq_client = AsyncOpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=GROQ_API_KEY
 )
 
 TIMEZONE_KZ = zoneinfo.ZoneInfo("Asia/Almaty")
+
+# ==========================================
+# ОБМАНКА ДЛЯ RENDER (WEB-ЗАГЛУШКА ПОРТА)
+# ==========================================
+async def handle_ping(request):
+    return web.Response(text="🎵 Megura Music Bot is active and running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    app.router.add_get("/health", handle_ping)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Веб-заглушка для Render запущена на порту {port}")
 
 # ==========================================
 # РАБОТА С БАЗОЙ ДАННЫХ (SQLite)
@@ -91,7 +84,6 @@ def get_db():
 def init_db():
     with get_db() as conn:
         cursor = conn.cursor()
-        # Ключи доступа
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS access_keys (
                 key_code TEXT PRIMARY KEY,
@@ -101,7 +93,6 @@ def init_db():
                 created_at TEXT
             )
         """)
-        # Пользователи с доступом
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS allowed_users (
                 user_id INTEGER PRIMARY KEY,
@@ -111,7 +102,6 @@ def init_db():
                 is_banned INTEGER DEFAULT 0
             )
         """)
-        # Кэш Telegram file_id
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS music_cache (
                 spotify_id TEXT PRIMARY KEY,
@@ -121,7 +111,6 @@ def init_db():
                 created_at TEXT
             )
         """)
-        # Очередь публикаций в канал
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS scheduled_posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,7 +127,6 @@ def init_db():
 # ВОССТАНОВЛЕНИЕ И БЭКАП БД С РЕНДЕРА
 # ==========================================
 async def backup_db_to_admin(reason="auto"):
-    """Отправка БД в ЛС админа"""
     if not os.path.exists(DB_FILE):
         return
     try:
@@ -154,27 +142,18 @@ async def backup_db_to_admin(reason="auto"):
         logger.error(f"Ошибка при отправке бэкапа БД: {e}")
 
 async def restore_db_from_telegram():
-    """Реальное восстановление БД из последнего сообщения с документом в ЛС с админом"""
     if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0:
         logger.info("Локальная база данных обнаружена.")
         return
 
     logger.info("База данных не найдена. Попытка восстановления из ЛС Админа...")
-    init_db() 
-    
+    init_db()
     try:
-        # Получаем обновления через getUpdates или скачиваем из истории чата с админом, 
-        # если бот поддерживает хранение. Так как Bot API не имеет метода getHistory для ЛС,
-        # используем резервный механизм: проверяем, отправлял ли админ файл или бот сохранял его.
-        # На практике на Render при деплое рекомендуется использовать persistent disk, 
-        # но здесь мы делаем программный перехват через поиск в чате (если бот видел сообщения).
         updates = await bot.get_updates(limit=100, timeout=1)
         backup_file_id = None
         for update in updates:
             if update.message and update.message.from_user.id == ADMIN_ID:
-                if update.message.document and update.message.document.file_name == "bot.db":
-                    backup_file_id = update.message.document.file_id
-                elif update.message.caption and "#db_backup" in update.message.caption and update.message.document:
+                if update.message.document and (update.message.document.file_name == "bot.db" or (update.message.caption and "#db_backup" in update.message.caption)):
                     backup_file_id = update.message.document.file_id
 
         if backup_file_id:
@@ -182,12 +161,12 @@ async def restore_db_from_telegram():
             await bot.download(file_info, destination=DB_FILE)
             logger.info("База данных успешно восстановлена из резервной копии Telegram!")
         else:
-            logger.info("Резервная копия в последних сообщениях не найдена. Создана пустая БД.")
+            logger.info("Резервная копия не найдена. Создана новая чистая БД.")
     except Exception as e:
         logger.error(f"Не удалось восстановить БД автоматически: {e}")
 
 # ==========================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ИИ GROQ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ПАРСИНГ СПОТИФАЙ
 # ==========================================
 def is_user_allowed(user_id: int) -> bool:
     if user_id == ADMIN_ID:
@@ -202,13 +181,57 @@ def extract_spotify_id(url: str) -> str | None:
     match = re.search(r"open\.spotify\.com/track/([a-zA-Z0-9]+)", url)
     return match.group(1) if match else None
 
+async def get_spotify_meta_via_scraping(spotify_id: str) -> dict:
+    """Парсинг метаданных трека со Spotify без использования официального API"""
+    url = f"https://open.spotify.com/track/{spotify_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        if response.status_code != 200:
+            raise Exception(f"Не удалось получить страницу Spotify (код {response.status_code})")
+            
+    soup = BeautifulSoup(response.text, 'html.parser')
+    og_title = soup.find("meta", property="og:title")
+    og_image = soup.find("meta", property="og:image")
+    
+    title = "Unknown Track"
+    artists = "Unknown Artist"
+    
+    if og_title and og_title.get("content"):
+        content = og_title["content"]
+        if " - song and lyrics by " in content:
+            parts = content.split(" - song and lyrics by ")
+            title = parts[0]
+            artists = parts[1].split(" | ")[0]
+        elif " - Song by " in content:
+            parts = content.split(" - Song by ")
+            title = parts[0]
+            artists = parts[1].split(" | ")[0]
+        else:
+            title = content.split(" | ")[0]
+
+    cover_url = og_image["content"] if og_image else None
+
+    return {
+        "spotify_id": spotify_id,
+        "title": title,
+        "artists": artists,
+        "album": "Spotify Single",
+        "album_artist": artists,
+        "year": str(datetime.now().year),
+        "track_number": 1,
+        "duration_sec": 210, # Усредненная длительность для Groq/yt-dlp
+        "cover_url": cover_url
+    }
+
 async def pick_best_candidate_via_groq(spotify_info: dict, candidates: list) -> int | None:
     prompt = f"""
     Дан оригинальный трек из Spotify:
     Исполнитель: {spotify_info['artists']}
     Название: {spotify_info['title']}
-    Альбом: {spotify_info['album']}
-    Длительность (сек): {spotify_info['duration_sec']}
 
     Вот список результатов с YouTube:
     {json.dumps(candidates, ensure_ascii=False, indent=2)}
@@ -236,29 +259,9 @@ async def pick_best_candidate_via_groq(spotify_info: dict, candidates: list) -> 
 # СКАЧИВАНИЕ, КОНВЕРТАЦИЯ И ТЕГИ
 # ==========================================
 async def process_spotify_track(spotify_id: str, work_dir: Path) -> tuple[Path, dict]:
-    track_data = sp.track(spotify_id)
-    title = track_data["name"]
-    artists = ", ".join([a["name"] for a in track_data["artists"]])
-    album = track_data["album"]["name"]
-    album_artist = track_data["album"]["artists"][0]["name"]
-    year = track_data["album"]["release_date"].split("-")[0]
-    track_num = track_data["track_number"]
-    duration_sec = int(track_data["duration_ms"] / 1000)
-    cover_url = track_data["album"]["images"][0]["url"] if track_data["album"]["images"] else None
+    meta = await get_spotify_meta_via_scraping(spotify_id)
 
-    meta = {
-        "spotify_id": spotify_id,
-        "title": title,
-        "artists": artists,
-        "album": album,
-        "album_artist": album_artist,
-        "year": year,
-        "track_number": track_num,
-        "duration_sec": duration_sec,
-        "cover_url": cover_url
-    }
-
-    search_query = f"{artists} - {title}"
+    search_query = f"{meta['artists']} - {meta['title']}"
     ydl_opts_search = {
         'extract_flat': 'in_playlist',
         'quiet': True,
@@ -287,12 +290,10 @@ async def process_spotify_track(spotify_id: str, work_dir: Path) -> tuple[Path, 
     if best_idx is not None and 0 <= best_idx < len(candidates):
         selected_url = candidates[best_idx]["url"]
     else:
-        # Безопасный резерв: ищем среди всех первый трек с подходящей длительностью (±4 сек)
         for c in candidates:
-            if c["duration"] and abs(c["duration"] - duration_sec) <= 4:
+            if c["duration"] and abs(c["duration"] - meta['duration_sec']) <= 30:
                 selected_url = c["url"]
                 break
-        # Если совсем ничего не подошло по длительности — берем первый результат как крайнюю мера
         if not selected_url:
             selected_url = candidates[0]["url"]
 
@@ -313,16 +314,16 @@ async def process_spotify_track(spotify_id: str, work_dir: Path) -> tuple[Path, 
 
     if out_filename.exists():
         audio = ID3(out_filename)
-        audio.add(TIT2(encoding=3, text=title))
-        audio.add(TPE1(encoding=3, text=artists))
-        audio.add(TALB(encoding=3, text=album))
-        audio.add(TPE2(encoding=3, text=album_artist))
-        audio.add(TDRC(encoding=3, text=year))
-        audio.add(TRCK(encoding=3, text=str(track_num)))
+        audio.add(TIT2(encoding=3, text=meta["title"]))
+        audio.add(TPE1(encoding=3, text=meta["artists"]))
+        audio.add(TALB(encoding=3, text=meta["album"]))
+        audio.add(TPE2(encoding=3, text=meta["album_artist"]))
+        audio.add(TDRC(encoding=3, text=meta["year"]))
+        audio.add(TRCK(encoding=3, text=str(meta["track_number"])))
 
-        if cover_url:
+        if meta["cover_url"]:
             import requests
-            img_data = await loop.run_in_executor(None, lambda: requests.get(cover_url).content)
+            img_data = await loop.run_in_executor(None, lambda: requests.get(meta["cover_url"]).content)
             audio.add(APIC(
                 encoding=3,
                 mime='image/jpeg',
@@ -380,16 +381,40 @@ async def check_and_publish_scheduled_posts():
                 logger.error(f"Ошибка автопостинга поста ID {post['id']}: {e}")
 
 # ==========================================
-# ХЕНДЛЕРЫ И ИНТЕРФЕЙС (Aiogram)
+# ХЕНДЛЕРЫ И ИНТЕРАКТИВНЫЙ ИНТЕРФЕЙС
 # ==========================================
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     if is_user_allowed(user_id):
-        await message.answer("👋 Привет! Отправь мне ссылку на трек из Spotify, и я скачаю его в максимальном качестве.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎶 Как скачивать музыку?", callback_data="help_info")]
+        ])
+        await message.answer(
+            "✨ **Добро пожаловать в персональную музыкальную студию!**\n\n"
+            "Я готов к работе. Отправь мне ссылку на трек из **Spotify**, и я превращу её в чистый аудиофайл **MP3 (320 kbps)** с обложкой и тегами, а также предложу отправить его в канал!",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
     else:
-        await message.answer("🔒 Бот закрыт. Введи ключ доступа (инвайт-код), чтобы начать работу:")
+        await message.answer(
+            "🔒 **Доступ ограничен**\n\n"
+            "Этот бот предназначен только для близких друзей. Пожалуйста, введи свой **инвайт-код доступа** (ключ вида `MEGURA-XXXX`), чтобы разблокировать функции бота:",
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(F.data == "help_info")
+async def cb_help_info(call: types.CallbackQuery):
+    await call.message.answer(
+        "💡 **Инструкция по использованию:**\n\n"
+        "1. Скопируй ссылку на трек из приложения Spotify (`https://open.spotify.com/track/...`).\n"
+        "2. Просто отправь её сюда в чат.\n"
+        "3. Бот найдет нужный трек через ИИ, скачает его и пришлет тебе в ЛС с кнопками управления.\n"
+        "4. Ты сможешь отправить его в канал (до 3 треков в день по расписанию в 06:00) или опубликовать мгновенно!",
+        parse_mode="Markdown"
+    )
+    await call.answer()
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
@@ -431,7 +456,6 @@ async def handle_admin_callbacks(call: types.CallbackQuery):
         else:
             rows = []
             for k in keys:
-                kb_del = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🗑 Отозвать", callback_data=f"delkey_{k['key_code']}")]])
                 rows.append(f"`{k['key_code']}` (использований: {k['uses_count']}/{k['max_uses']})")
             await call.message.answer("🔑 **Список ключей:**\n" + "\n".join(rows), parse_mode="Markdown")
 
@@ -463,17 +487,6 @@ async def handle_admin_callbacks(call: types.CallbackQuery):
     
     await call.answer()
 
-@dp.callback_query(F.data.startswith("delkey_"))
-async def cb_delete_key(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        return
-    key_code = call.data.split("_")[1]
-    with get_db() as conn:
-        conn.execute("DELETE FROM access_keys WHERE key_code = ?", (key_code,))
-        conn.commit()
-    await call.message.edit_text(f"🗑 Ключ `{key_code}` удален.", parse_mode="Markdown")
-    await call.answer()
-
 @dp.callback_query(F.data.startswith(("ban_", "unban_")))
 async def cb_toggle_ban(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -487,14 +500,12 @@ async def cb_toggle_ban(call: types.CallbackQuery):
     await call.message.edit_text(f"✅ Статус блокировки пользователя `{user_id}` изменен.", parse_mode="Markdown")
     await call.answer()
 
-# Исправленная безопасная активация ключей (без сброса бана)
 @dp.message(F.text.startswith("MEGURA-"))
 async def process_key_activation(message: types.Message):
     user_id = message.from_user.id
     key_code = message.text.strip()
 
     with get_db() as conn:
-        # Проверяем, не забанен ли пользователь уже
         existing_user = conn.execute("SELECT is_banned FROM allowed_users WHERE user_id = ?", (user_id,)).fetchone()
         if existing_user and existing_user["is_banned"] == 1:
             await message.answer("❌ Ваш аккаунт заблокирован.")
@@ -505,7 +516,6 @@ async def process_key_activation(message: types.Message):
             now_str = datetime.now(TIMEZONE_KZ).strftime("%Y-%m-%d %H:%M:%S")
             conn.execute("UPDATE access_keys SET uses_count = uses_count + 1 WHERE key_code = ?", (key_code,))
             
-            # Используем безопасный INSERT OR IGNORE для избежания сброса параметров существующей записи
             conn.execute("""
                 INSERT INTO allowed_users (user_id, username, activated_with_key, joined_at, is_banned)
                 VALUES (?, ?, ?, ?, 0)
@@ -514,12 +524,11 @@ async def process_key_activation(message: types.Message):
             """, (user_id, message.from_user.username or "NoUsername", key_code, now_str))
             conn.commit()
             
-            await message.answer("✅ **Доступ успешно получен!** Теперь ты можешь присылать ссылки на Spotify.")
+            await message.answer("🎉 **Доступ успешно получен!** Теперь отправь мне ссылку на трек из Spotify.")
             await backup_db_to_admin("key_activated")
         else:
             await message.answer("❌ Недействительный или уже использованный ключ доступа.")
 
-# Обработка ссылок Spotify
 @dp.message(F.text.contains("open.spotify.com/track/"))
 async def handle_spotify_link(message: types.Message):
     user_id = message.from_user.id
@@ -533,7 +542,7 @@ async def handle_spotify_link(message: types.Message):
         await message.answer("❌ Неверный формат ссылки на трек Spotify.")
         return
 
-    status_msg = await message.answer("🔎 Ищу и скачиваю трек...")
+    status_msg = await message.answer("🔎 Ищу и скачиваю трек в максимальном качестве...")
 
     with get_db() as conn:
         cached = conn.execute("SELECT file_id, title, artist FROM music_cache WHERE spotify_id = ?", (spotify_id,)).fetchone()
@@ -592,7 +601,6 @@ async def handle_spotify_link(message: types.Message):
             item.unlink()
         work_dir.rmdir()
 
-# Защищенный колбэк публикации в очередь с проверкой прав
 @dp.callback_query(F.data.startswith("pub_"))
 async def cb_publish_track(call: types.CallbackQuery):
     if not is_user_allowed(call.from_user.id):
@@ -620,7 +628,6 @@ async def cb_publish_track(call: types.CallbackQuery):
     await backup_db_to_admin("add_to_queue")
     await call.answer()
 
-# Мгновенная публикация трека в канал («сейчас»)
 @dp.callback_query(F.data.startswith("now_"))
 async def cb_publish_now(call: types.CallbackQuery):
     if not is_user_allowed(call.from_user.id):
@@ -654,8 +661,13 @@ async def cb_skip_track(call: types.CallbackQuery):
 # ТОЧКА ВХОДА И ЗАПУСК
 # ==========================================
 async def main():
+    # Запускаем веб-заглушку для порта Render
+    await start_web_server()
+
+    # Восстановление БД из Telegram
     await restore_db_from_telegram()
     
+    # Планировщики
     scheduler.add_job(check_and_publish_scheduled_posts, 'interval', minutes=1)
     scheduler.add_job(backup_db_to_admin, 'interval', hours=6, kwargs={"reason": "cron_6h"})
     scheduler.start()
